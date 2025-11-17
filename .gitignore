@@ -1,0 +1,14 @@
+# ignore large files
+*.log
+*.csv
+
+# ignore env
+.env
+
+# ignore Python cache
+__pycache__/
+
+# ignore IDE folders
+.vscode/
+.idea/
+venv/

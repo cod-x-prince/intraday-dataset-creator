@@ -1,0 +1,350 @@
+# run_prediction_engine.py (Final, Robust Version)
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import pandas as pd
+import talib as ta
+import joblib
+from alpaca_trade_api.rest import REST, TimeFrame, APIError
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import json
+import warnings
+import logging
+import time
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+from datetime import datetime, timedelta #Import timedelta explicitly
+
+warnings.filterwarnings('ignore')
+
+# --- Centralized Configuration ---
+
+load_dotenv()  # Load environment variables from .env
+
+CONFIG = {
+    "api_key": os.getenv("ALPACA_API_KEY"),
+    "secret_key": os.getenv("ALPACA_SECRET_KEY"),
+    "base_url": 'https://api.alpaca.markets',
+    "universe": ['NVDA', 'TSLA', 'MSFT', 'SPY', 'GLD'],
+    "model_file": "trader_ai_model.pkl",
+    "scaler_file": "feature_scaler.pkl",
+    "output_file": "predictions.json",
+    "log_file": "engine.log",
+    
+    # 1. Data Frequency Experimentation
+    "data_frequency": "15Min",  # Options: "5Min", "15Min", "1Hour"
+    
+    # 2. Feature Scaling
+    "scaling_method": "standard",  # Options: "standard", "minmax"
+    
+    # 3. Model Retraining Configuration
+    "retrain_model": False, # Set to True to trigger retraining
+    "retraining_days": 365, # How many days of data to use for retraining
+    
+    # 7. API Rate Limiting
+    "api_retry_attempts": 3,
+    "api_retry_delay_seconds": 15,
+}
+
+# --- Frequency Mapping ---
+FREQUENCY_MAP = {
+    "5Min": {"timeframe": TimeFrame.Minute, "resample": "5T"},
+    "15Min": {"timeframe": TimeFrame.Minute, "resample": "15T"},
+    "1Hour": {"timeframe": TimeFrame.Hour, "resample": "1H"},
+}
+
+def setup_logging():
+    """Sets up comprehensive logging to both file and console."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(CONFIG["log_file"]),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info("Logging initialized.")
+
+def connect_alpaca_api():
+    """Establishes and returns a connection to the Alpaca API."""
+    try:
+        api = REST(key_id=CONFIG["api_key"], secret_key=CONFIG["secret_key"], base_url=CONFIG["base_url"])
+        api.get_account() # Verify connection
+        logging.info("Successfully connected to Alpaca API.")
+        return api
+    except APIError as e:
+        logging.error(f"Failed to connect to Alpaca API: {e}")
+        return None
+
+def fetch_data(api, ticker, days):
+    freq_details = FREQUENCY_MAP[CONFIG["data_frequency"]]
+    end_date = datetime.now().date() # Get only the date part
+    start_date = end_date - timedelta(days=days)  # Calculate start date
+    all_bars = pd.DataFrame()
+
+    current_start = start_date
+    while current_start < end_date:
+        # Fetch in chunks to respect API limits
+        next_end_date = min(end_date, current_start + timedelta(days=30))
+        try:
+            # Explicitly request the IEX feed to avoid subscription errors on free plans
+            bars = api.get_bars(
+                ticker, 
+                freq_details["timeframe"], 
+                start=current_start.strftime("%Y-%m-%d"), 
+                end=next_end_date.strftime("%Y-%m-%d"), 
+                adjustment='raw',
+                feed='iex'  # <-- FIX 1: Specify the data feed
+            ).df
+            
+            if not bars.empty:
+                all_bars = pd.concat([all_bars, bars])
+            
+            # Corrected logging message to show the range just fetched
+            logging.info(f"Fetched data for {ticker} from {current_start.strftime('%Y-%m-%d')} to {next_end_date.strftime('%Y-%m-%d')}")
+            
+            current_start = next_end_date # Move to the next chunk
+            time.sleep(1) # Be respectful to the API
+
+        except APIError as e:
+            logging.warning(f"API Error fetching data for {ticker}: {e}")
+            if e.status_code == 429: # Rate limit
+                logging.warning("Rate limit hit. Waiting...")
+                time.sleep(CONFIG['api_retry_delay_seconds'])
+            else:
+                break # Break on other API errors for this ticker
+
+    return all_bars
+
+def preprocess_data(bars, scaler=None, fit_scaler=False):
+    logging.info(f"Starting preprocessing. Initial rows: {len(bars)}")
+    if bars.empty:
+        logging.warning("Input DataFrame is empty. Returning empty DataFrame.")
+        return pd.DataFrame(), None
+
+    resample_freq = FREQUENCY_MAP[CONFIG["data_frequency"]]["resample"]
+    try:
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            bars.index = pd.to_datetime(bars.index)
+            
+        bars = bars.resample(resample_freq).agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+        logging.info(f"After resampling: {len(bars)} rows")
+        
+        bars.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        
+        bars.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
+        logging.info(f"After initial dropna for OHLCV: {len(bars)} rows")
+
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in bars.columns for col in required_cols):
+            missing_cols = set(required_cols) - set(bars.columns)
+            logging.error(f"Essential columns missing after resampling: {missing_cols}.")
+            return pd.DataFrame(), None
+
+        # --- Feature Engineering ---
+        bars['Price_Range'] = bars['High'] - bars['Low']
+        bars[['High', 'Low', 'Close']] = bars[['High', 'Low', 'Close']].astype(float)
+
+        bars['ATRr_14'] = ta.ATR(bars['High'], bars['Low'], bars['Close'], timeperiod=14)
+        bars['RSI_14'] = ta.RSI(bars['Close'], timeperiod=14)
+        logging.info(f"After ATR/RSI calculation. Columns: {bars.columns.tolist()}")
+
+        # --- FIX: The Clean Data Calculation ---
+        if not bars.empty:
+            # 1. Create the sparse 1-hour series (with gaps)
+            df_1h = bars['Close'].resample('1H').last()
+            
+            # 2. Create a clean, temporary series by dropping all non-trading hours
+            df_1h_clean = df_1h.dropna()
+            
+            # 3. Check if there's enough data to calculate RSI, then calculate on the clean series
+            if len(df_1h_clean) >= 15: # 14 periods for RSI + 1
+                rsi_1h_values = ta.RSI(df_1h_clean, timeperiod=14)
+                # 4. Map the valid results back to the main dataframe
+                bars['RSI_1h'] = rsi_1h_values.reindex(bars.index, method='ffill').bfill()
+            else:
+                logging.warning("Not enough hourly data to calculate RSI_1h. Filling with 50.")
+                bars['RSI_1h'] = 50 # Fallback if data is too sparse
+        else:
+            bars['RSI_1h'] = np.nan
+        
+        # Drop any remaining NaNs after all features are created
+        bars.dropna(inplace=True)
+        logging.info(f"After final dropna (post-feature engineering): {len(bars)} rows")
+
+        if bars.empty:
+            logging.warning("DataFrame is empty after feature engineering and dropna. Cannot proceed.")
+            return pd.DataFrame(), None
+
+        features_list = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_1h', 'ATRr_14', 'RSI_14', 'Price_Range']
+        X = bars[features_list]
+
+        # --- Scaling Logic (Unchanged) ---
+        if fit_scaler:
+            if CONFIG["scaling_method"] == "standard":
+                scaler = StandardScaler()
+            elif CONFIG["scaling_method"] == "minmax":
+                scaler = MinMaxScaler()
+            else:
+                return X, None
+            X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+            logging.info(f"Fitted and transformed data using {CONFIG['scaling_method']} scaling.")
+            return X_scaled, scaler
+        
+        if scaler:
+             X_scaled = pd.DataFrame(scaler.transform(X), columns=X.columns, index=X.index)
+             return X_scaled, scaler
+
+    except Exception as e:
+        logging.exception(f"An unexpected error occurred during data preprocessing: {e}")
+        return pd.DataFrame(), None
+
+    return X, None
+
+def train_model(api):
+    """Fetches new data and retrains the XGBoost model and scaler."""
+    logging.info("--- Starting Model Retraining ---")
+    all_features = []
+    
+    for ticker in CONFIG["universe"]:
+        bars = fetch_data(api, ticker, days=CONFIG["retraining_days"])
+        if not bars.empty:
+            features, _ = preprocess_data(bars) # No scaling needed yet
+            # Create target variable (e.g., price up/down in next period)
+            features['target'] = (features['Close'].shift(-1) > features['Close']).astype(int)
+            features.dropna(inplace=True)
+            all_features.append(features)
+
+    if not all_features:
+        logging.error("No data available for any ticker. Retraining aborted.")
+        return
+
+    full_dataset = pd.concat(all_features)
+    y = full_dataset['target']
+    X = full_dataset.drop(columns=['target'])
+    
+    # Fit and save the scaler
+    if CONFIG["scaling_method"] in ["standard", "minmax"]:
+        scaler_to_fit = StandardScaler() if CONFIG["scaling_method"] == "standard" else MinMaxScaler()
+        X_scaled = pd.DataFrame(scaler_to_fit.fit_transform(X), columns=X.columns, index=X.index)
+        joblib.dump(scaler_to_fit, CONFIG["scaler_file"])
+        logging.info(f"Scaler saved to {CONFIG['scaler_file']}")
+    else:
+        X_scaled = X
+
+    # Train the XGBoost model
+    model = xgb.XGBClassifier(objective='binary:logistic', eval_metric='logloss', use_label_encoder=False)
+    model.fit(X_scaled, y)
+    logging.info("XGBoost model retrained successfully.")
+    
+    # Save the model
+    joblib.dump(model, CONFIG["model_file"])
+    logging.info(f"Retrained model saved to {CONFIG['model_file']}")
+
+
+def run_predictions(api):
+    """Fetches live data and generates buy/sell signals."""
+    logging.info("--- Starting Prediction Engine Run ---")
+    
+    try:
+        model = joblib.load(CONFIG["model_file"])
+        scaler = joblib.load(CONFIG["scaler_file"]) if CONFIG["scaling_method"] in ["standard", "minmax"] else None
+    except FileNotFoundError:
+        logging.error(f"Model or scaler file not found. Please run with `retrain_model = True` first.")
+        return
+
+    clock = api.get_clock()
+    if not clock.is_open:
+        logging.info("Market is closed. No predictions will be generated.")
+        return
+    logging.info("Market is open. Fetching live data...")
+
+    all_predictions = {}
+    for ticker in CONFIG["universe"]:
+        logging.info(f"Processing {ticker}...")
+        bars = fetch_data(api, ticker, days=730) # Fetch enough data for indicators
+        if bars.empty:
+            logging.warning(f"No recent data for {ticker}. Skipping.")
+            continue
+        
+        X_processed, _ = preprocess_data(bars, scaler=scaler, fit_scaler=False)
+        
+        if X_processed.empty:
+            logging.warning(f"Not enough data to generate features for {ticker}. Skipping.")
+            continue
+            
+        latest_row = X_processed.tail(1)
+        
+        prediction = model.predict(latest_row)[0]
+        signal = "UP" if prediction == 1 else "DOWN"
+        all_predictions[ticker] = {"signal": signal, "timestamp": latest_row.index[0].isoformat()}
+        logging.info(f"Prediction for {ticker}: {signal}")
+
+        # 5. Risk Management Suggestions
+        # TODO: Implement Position Sizing: Calculate position size based on volatility (e.g., using ATR) and account risk percentage.
+        # Example: risk_per_trade = account_value * 0.01; position_size = risk_per_trade / (latest_atr * 2)
+
+        # TODO: Implement Stop-Loss and Take-Profit: When placing an order via the API, include stop-loss/take-profit levels.
+        # Example: stop_loss_price = latest_close - (latest_atr * 2); take_profit_price = latest_close + (latest_atr * 4)
+
+    # TODO: Diversification check before placing trades across the universe. Ensure not all signals are correlated.
+
+    logging.info(f"Saving all predictions to {CONFIG['output_file']}...")
+    with open(CONFIG["output_file"], 'w') as f:
+        json.dump(all_predictions, f, indent=4)
+    logging.info(" Prediction engine run complete.")
+
+
+def run_backtest():
+    """Placeholder for integrating a backtesting library."""
+    logging.info("--- Starting Backtesting ---")
+    logging.warning("Backtesting is not fully implemented. This is a conceptual example.")
+    
+    # 4. Backtesting Integration Suggestion
+    # Libraries like `backtesting.py`, `zipline`, or `VectorBT` are recommended.
+    # Below is a conceptual example using `backtesting.py`
+    
+    # from backtesting import Backtest, Strategy
+    # from backtesting.lib import crossover
+
+    # class XGBoostStrategy(Strategy):
+    #     def init(self):
+    #         # Pre-calculate your signals here
+    #         # self.signals = self.I(lambda: pre_calculated_signals_array)
+    #         pass
+
+    #     def next(self):
+    #         if self.signals[-1] == 1: # UP signal
+    #             self.buy()
+    #         elif self.signals[-1] == 0: # DOWN signal (or sell)
+    #             self.sell()
+
+    # # 1. Load historical data
+    # bt_data = fetch_data(api, 'SPY', days=730) 
+    
+    # # 2. Generate signals for the entire historical dataset
+    # # pre_calculated_signals = model.predict(scaled_historical_features)
+    
+    # # 3. Run the backtest
+    # bt = Backtest(bt_data, XGBoostStrategy, cash=10000, commission=.002)
+    # stats = bt.run()
+    # print(stats) # Shows Sharpe Ratio, Max Drawdown, etc.
+    # bt.plot()
+    logging.info("To implement backtesting, uncomment the conceptual code and install a library like `backtesting.py`.")
+
+
+if __name__ == "__main__":
+    setup_logging()
+    api_connection = connect_alpaca_api()
+
+    if api_connection:
+        if CONFIG["retrain_model"]:
+            train_model(api_connection)
+        else:
+            run_predictions(api_connection)
+            # To run a backtest, you would call it here:
+            # run_backtest()
+    else:
+        logging.critical("Could not establish API connection. Exiting.")
+# Optional, for backtesting functionalit

@@ -1,0 +1,6 @@
+open two venv env
+
+python run_worker.py
+python flask_dashboard/app.py
+celery -A worker.app beat --loglevel=info
+http://127.0.0. 1:5000

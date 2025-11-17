@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{{ title }}</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+        background-color: #121212;
+        color: #e0e0e0;
+        margin: 0;
+        display: flex;
+        height: 100vh;
+      }
+      .control-panel {
+        width: 250px;
+        background-color: #1e1e1e;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 5px 0 15px rgba(0, 0, 0, 0.5);
+        overflow-y: auto;
+      }
+      .display-area {
+        flex-grow: 1;
+        padding: 20px;
+        overflow-y: auto;
+      }
+      .control-panel h2 {
+        margin-top: 0;
+      }
+      .control-panel label {
+        display: block;
+        margin-top: 15px;
+        color: #aaa;
+      }
+      .control-panel button,
+      .control-panel a button {
+        width: 100%;
+        padding: 10px;
+        margin-top: 15px;
+        font-weight: bold;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        text-align: center;
+      }
+      .control-panel a {
+        text-decoration: none;
+      }
+      .control-panel textarea {
+        width: 100%;
+        height: 100px;
+        margin-top: 5px;
+        background-color: #404040;
+        color: white;
+        border: 1px solid #555;
+        border-radius: 5px;
+        resize: vertical;
+      }
+      .preset-buttons button {
+        background-color: #444;
+        margin-top: 5px;
+        width: auto;
+        padding: 5px 10px;
+        font-weight: normal;
+        margin-right: 5px;
+      }
+      .status {
+        font-weight: bold;
+        border-radius: 5px;
+        padding: 5px 10px;
+        text-align: center;
+        margin-bottom: 10px;
+      }
+      .status.running {
+        color: #28a745;
+        background-color: rgba(40, 167, 69, 0.2);
+      }
+      .status.stopped {
+        color: #dc3545;
+        background-color: rgba(220, 53, 69, 0.2);
+      }
+      .status.unknown {
+        color: #ffc107;
+        background-color: rgba(255, 193, 7, 0.2);
+      }
+      .header {
+        text-align: center;
+      }
+      .grid-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 20px;
+        padding: 20px 0;
+      }
+      .card {
+        background-color: #2a2a2a;
+        border-radius: 10px;
+        padding: 20px;
+        border-left: 5px solid #555;
+      }
+      .card.up {
+        border-left-color: #28a745;
+      }
+      .card.down {
+        border-left-color: #dc3545;
+      }
+      .ticker-link {
+        text-decoration: none;
+        color: #e0e0e0;
+      }
+      .ticker-name {
+        font-size: 2em;
+        font-weight: bold;
+        margin: 0;
+      }
+      .signal {
+        font-size: 1.5em;
+        font-weight: bold;
+        margin: 10px 0;
+      }
+      .signal.up {
+        color: #28a745;
+      }
+      .signal.down {
+        color: #dc3545;
+      }
+      .details {
+        font-size: 0.9em;
+        color: #aaa;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="control-panel">
+      <h2>Controls</h2>
+      <label>Engine Status:</label>
+      <div class="status {{ engine_status }}">{{ engine_status.upper() }}</div>
+      <a href="{{ url_for('start_engine') }}"
+        ><button type="button" style="background-color: #28a745">
+          Start Engine
+        </button></a
+      >
+      <a href="{{ url_for('stop_engine') }}"
+        ><button
+          type="button"
+          style="background-color: #dc3545; margin-top: 5px"
+        >
+          Stop Engine
+        </button></a
+      >
+      <form method="POST" style="margin-top: 20px">
+        <label for="tickers">Ticker Universe:</label>
+        <textarea name="tickers" id="tickers">{{ ticker_string }}</textarea>
+        <div class="preset-buttons">
+          {% for name, value in preset_tickers.items() %}
+          <button type="button" onclick="set_tickers('{{ value }}')">
+            {{ name }}
+          </button>
+          {% endfor %}
+        </div>
+        <button type="submit" style="background-color: #007bff">
+          Save Tickers
+        </button>
+      </form>
+    </div>
+    <div class="display-area">
+      <div class="header"><h1>{{ title }} 🚀</h1></div>
+      <div class="grid-container">
+        {% for ticker, data in predictions.items() %}
+        <div class="card {{ 'up' if data.signal == 'UP' else 'down' }}">
+          <a
+            href="https://www.tradingview.com/chart/?symbol={{ ticker }}"
+            target="_blank"
+            class="ticker-link"
+          >
+            <h2 class="ticker-name">{{ ticker }}</h2>
+          </a>
+          <p class="signal {{ 'up' if data.signal == 'UP' else 'down' }}">
+            {{ data.signal }}
+          </p>
+          <div class="details">
+            <strong>Confidence:</strong> {{ data.confidence }} <br />
+            <strong>Key Drivers:</strong> {{ data.drivers | join(', ') }}
+          </div>
+        </div>
+        {% else %}
+        <p>No predictions to display. Check ticker list or run the engine.</p>
+        {% endfor %}
+      </div>
+    </div>
+    <script>
+      function set_tickers(ticker_list) {
+        document.getElementById("tickers").value = ticker_list;
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+{
+    "TSLA": {
+        "ticker": "TSLA",
+        "signal": "UP",
+        "confidence": "58.93%",
+        "drivers": [
+            "MACD",
+            "RSI_1h",
+            "RSI_14"
+        ],
+        "timestamp": "2025-09-11T19:45:00+00:00"
+    }
+}

@@ -1,0 +1,108 @@
+import pandas as pd
+import joblib
+import logging
+import talib as ta
+from alpaca_trade_api.rest import REST
+import os
+from dotenv import load_dotenv
+from backtesting import Backtest, Strategy
+from scipy.signal import find_peaks
+from run_prediction_engine import connect_alpaca_api, fetch_data, preprocess_data
+
+# --- Backtester Configuration ---
+BACKTEST_CONFIG = {"ticker": "SPY","start_date": "2023-01-01","end_date": "2024-12-31","initial_cash": 10000,"commission_rate": 0.002,"model_file": "trader_ai_model.pkl","scaler_file": "feature_scaler.pkl"}
+
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_model_and_scaler():
+    try:
+        model = joblib.load(BACKTEST_CONFIG["model_file"])
+        scaler = joblib.load(BACKTEST_CONFIG["scaler_file"])
+        return model, scaler
+    except FileNotFoundError:
+        return None, None
+
+def generate_historical_signals(historical_data, model, scaler):
+    X_processed, _ = preprocess_data(historical_data, scaler=scaler, fit_scaler=False)
+    X_processed['SMA200'] = ta.SMA(X_processed['Close'], timeperiod=200)
+    X_processed['ADX14'] = ta.ADX(X_processed['High'], X_processed['Low'], X_processed['Close'], timeperiod=14)
+    X_processed.dropna(inplace=True)
+    features_for_prediction = X_processed.drop(columns=['SMA200', 'ADX14'])
+    predictions = model.predict(features_for_prediction)
+    X_processed['signal'] = predictions
+    return X_processed
+
+def get_last_swing(price_series):
+    series = price_series.tail(100)
+    peaks, _ = find_peaks(series)
+    troughs, _ = find_peaks(-series)
+    if len(peaks) > 0 and len(troughs) > 0:
+        last_high_idx, last_low_idx = series.index[peaks[-1]], series.index[troughs[-1]]
+        return series[last_low_idx], series[last_high_idx]
+    return None, None
+
+class MLStrategy(Strategy):
+    adx_threshold = 25
+    stop_loss_pct = 0.02
+    take_profit_pct = 0.04
+
+    def init(self):
+        self.signal = self.I(lambda: self.data.signal, name="ML_Signal")
+        self.sma = self.I(lambda: self.data.SMA200, name="SMA200")
+        self.adx = self.I(lambda: self.data.ADX14, name="ADX14")
+
+    def next(self):
+        price = self.data.Close[-1]
+        is_in_discount = False
+        last_low, last_high = get_last_swing(pd.Series(self.data.Close))
+        if last_low and last_high and last_high > last_low:
+            if price < (last_high - (last_high - last_low) * 0.5):
+                is_in_discount = True
+        
+        is_strong_trend = self.adx[-1] > self.adx_threshold
+        is_primary_uptrend = price > self.sma[-1]
+        is_buy_signal = self.signal[-1] == 1
+        is_sell_signal = self.signal[-1] == 0
+
+        if is_strong_trend and is_primary_uptrend and is_buy_signal and is_in_discount and not self.position:
+            sl_price = price * (1 - self.stop_loss_pct)
+            tp_price = price * (1 + self.take_profit_pct)
+            self.buy(sl=sl_price, tp=tp_price)
+        elif is_sell_signal and self.position:
+            self.position.close()
+
+
+# --- Main Backtesting Execution ---
+if __name__ == "__main__":
+    setup_logging()
+    
+    logging.info(f"--- Starting Filtered Backtest for {BACKTEST_CONFIG['ticker']} ---")
+    model, scaler = load_model_and_scaler()
+    api = connect_alpaca_api()
+
+    if model and scaler and api:
+        logging.info("Fetching historical data...")
+        raw_data = fetch_data(api, BACKTEST_CONFIG['ticker'], days=365*3)
+        
+        data_with_signals = generate_historical_signals(raw_data, model, scaler)
+        
+        backtest_data = data_with_signals.loc[BACKTEST_CONFIG['start_date']:BACKTEST_CONFIG['end_date']]
+        
+        if backtest_data.empty:
+            logging.error("No data available for the specified backtest date range. Exiting.")
+        else:
+            logging.info(f"Backtesting on {len(backtest_data)} candles from {BACKTEST_CONFIG['start_date']} to {BACKTEST_CONFIG['end_date']}...")
+            
+            bt = Backtest(
+                backtest_data, 
+                MLStrategy, 
+                cash=BACKTEST_CONFIG['initial_cash'], 
+                commission=BACKTEST_CONFIG['commission_rate']
+            )
+            
+            stats = bt.run()
+            
+            logging.info("--- Filtered Backtest Results ---")
+            print(stats)
+            bt.plot()
